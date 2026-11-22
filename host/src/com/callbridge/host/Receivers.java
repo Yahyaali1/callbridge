@@ -15,6 +15,8 @@ public final class Receivers {
     /** Starts the bridge service after boot / app update. */
     public static class Boot extends BroadcastReceiver {
         @Override public void onReceive(Context ctx, Intent intent) {
+            String a = intent.getAction();
+            if (!Intent.ACTION_BOOT_COMPLETED.equals(a) && !Intent.ACTION_MY_PACKAGE_REPLACED.equals(a)) return;
             BridgeService.start(ctx);
         }
     }
@@ -22,6 +24,9 @@ public final class Receivers {
     /** Backup call-state source (system PHONE_STATE broadcast). Also carries the caller's number. */
     public static class CallState extends BroadcastReceiver {
         @Override public void onReceive(Context ctx, Intent intent) {
+            // PHONE_STATE is a protected broadcast only the system can send. Without this check any app
+            // holding READ_PHONE_STATE could target this exported receiver with fake call states.
+            if (!android.telephony.TelephonyManager.ACTION_PHONE_STATE_CHANGED.equals(intent.getAction())) return;
             String st = intent.getStringExtra(android.telephony.TelephonyManager.EXTRA_STATE);
             int code = android.telephony.TelephonyManager.EXTRA_STATE_RINGING.equals(st) ? android.telephony.TelephonyManager.CALL_STATE_RINGING
                     : android.telephony.TelephonyManager.EXTRA_STATE_OFFHOOK.equals(st) ? android.telephony.TelephonyManager.CALL_STATE_OFFHOOK
@@ -39,6 +44,7 @@ public final class Receivers {
     /** Forwards incoming SMS to phone B. */
     public static class Sms extends BroadcastReceiver {
         @Override public void onReceive(Context ctx, Intent intent) {
+            if (!Telephony.Sms.Intents.SMS_RECEIVED_ACTION.equals(intent.getAction())) return;
             SmsMessage[] msgs = Telephony.Sms.Intents.getMessagesFromIntent(intent);
             if (msgs == null) return;
             Map<String, StringBuilder> bodies = new LinkedHashMap<>();

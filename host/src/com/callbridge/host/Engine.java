@@ -13,6 +13,7 @@ import android.media.MediaRecorder;
 import android.os.Looper;
 
 import com.callbridge.common.Proto;
+import com.callbridge.common.Secure;
 
 import org.json.JSONObject;
 
@@ -90,8 +91,11 @@ public class Engine {
         try {
             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
-            JSONObject hello = Proto.read(in).json();
-            if (!token.equals(hello.optString("token"))) {
+            // Any local app can reach this port: bound the unauthenticated hello in size and time.
+            s.setSoTimeout(5000);
+            JSONObject hello = Proto.read(in, 4096).json();
+            s.setSoTimeout(0);
+            if (token.isEmpty() || !Secure.equal(token, hello.optString("token"))) {
                 Proto.json(out, Proto.msg("error").put("error", "bad token"));
                 return;
             }

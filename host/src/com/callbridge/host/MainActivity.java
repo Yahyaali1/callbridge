@@ -23,7 +23,6 @@ import org.json.JSONObject;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
-import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -81,11 +80,25 @@ public class MainActivity extends Activity {
         root.addView(battery);
         Button regen = new Button(this); regen.setText("New pairing code");
         regen.setOnClickListener(v -> {
-            getSharedPreferences("bridge", MODE_PRIVATE).edit()
-                    .putString("code", String.format("%06d", new SecureRandom().nextInt(1_000_000))).apply();
+            BridgeService svc = BridgeService.instance;
+            if (svc != null) svc.regenerateCode();
+            else getSharedPreferences("bridge", MODE_PRIVATE).edit().putString("code", BridgeService.newCode())
+                    .putInt("pair_failures", 0).putLong("pair_lock_until", 0).apply();
             refresh();
         });
         root.addView(regen);
+        Button unpair = new Button(this); unpair.setText("Unpair phone B");
+        unpair.setOnClickListener(v -> new android.app.AlertDialog.Builder(this)
+                .setMessage("Phone B will be disconnected and must pair again with a new code.")
+                .setPositiveButton("Unpair", (d, w) -> {
+                    BridgeService svc = BridgeService.instance;
+                    if (svc != null) svc.unpair();
+                    else getSharedPreferences("bridge", MODE_PRIVATE).edit().remove("pair_key")
+                            .putString("code", BridgeService.newCode()).apply();
+                    refresh();
+                })
+                .setNegativeButton("Cancel", null).show());
+        root.addView(unpair);
 
         ScrollView sv = new ScrollView(this);
         sv.addView(root);
@@ -101,7 +114,9 @@ public class MainActivity extends Activity {
         code.setText(getSharedPreferences("bridge", MODE_PRIVATE).getString("code", "…"));
         addr.setText(String.join("\n", localAddresses()) + "\nport 8765");
         BridgeService svc = BridgeService.instance;
-        phoneB.setText(svc == null ? "Service starting…" : svc.clientConnected() ? "● Connected" : "○ Not connected");
+        boolean paired = !getSharedPreferences("bridge", MODE_PRIVATE).getString("pair_key", "").isEmpty();
+        phoneB.setText(svc == null ? "Service starting…" : svc.clientConnected() ? "● Connected"
+                : paired ? "○ Paired, not connected" : "○ Not paired — enter the code below on phone B");
 
         boolean allGranted = true;
         for (String p : perms()) if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) allGranted = false;

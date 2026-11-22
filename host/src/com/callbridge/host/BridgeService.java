@@ -21,6 +21,7 @@ import android.telephony.TelephonyManager;
 import android.util.Log;
 
 import com.callbridge.common.Proto;
+import com.callbridge.common.Secure;
 
 import org.json.JSONObject;
 
@@ -28,6 +29,7 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -36,6 +38,8 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 /**
  * Always-on (foreground) service on the host phone (the one with the SIM). Accepts one connection from phone B over
@@ -45,6 +49,14 @@ import java.util.concurrent.Executors;
 public class BridgeService extends Service {
     static final String TAG = "CallBridge";
     static volatile BridgeService instance;
+
+    // Pairing brute-force throttle: a few free tries, then an exponentially growing lockout.
+    static final int FREE_PAIR_ATTEMPTS = 5;
+    static final long PAIR_LOCK_BASE_MS = 30_000;
+    static final long PAIR_LOCK_MAX_MS = 3_600_000;
+    static final int MAX_PENDING = 4;            // concurrent not-yet-authenticated connections
+    static final Pattern NUMBER = Pattern.compile("[0-9+*#,;() .-]{1,64}");
+    static final int MAX_SMS_CHARS = 5000;
 
     final Handler main = new Handler(Looper.getMainLooper());
     final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -63,6 +75,9 @@ public class BridgeService extends Service {
     volatile String lastDialed = "";
     volatile long callStart;
 
+    final AtomicInteger pending = new AtomicInteger();
+    final Object pairLock = new Object();
+
     // ------------------------------------------------------------------ lifecycle
 
     @Override public void onCreate() {
@@ -70,7 +85,7 @@ public class BridgeService extends Service {
         instance = this;
         prefs = getSharedPreferences("bridge", MODE_PRIVATE);
         if (!prefs.contains("code")) {
-            prefs.edit().putString("code", String.format("%06d", new SecureRandom().nextInt(1_000_000))).apply();
+            prefs.edit().putString("code", newCode()).apply();
         }
         telecom = getSystemService(TelecomManager.class);
         tel = getSystemService(TelephonyManager.class);
@@ -129,6 +144,62 @@ public class BridgeService extends Service {
     @Override public IBinder onBind(Intent intent) { return null; }
 
     String pairCode() { return prefs.getString("code", ""); }
+
+    static String newCode() { return String.format("%06d", new SecureRandom().nextInt(1_000_000)); }
+
+    boolean isPaired() { return !prefs.getString("pair_key", "").isEmpty(); }
+
+    /** New pairing code (user action on this phone): also clears any brute-force lockout. */
+    void regenerateCode() {
+        synchronized (pairLock) {
+            prefs.edit().putString("code", newCode()).putInt("pair_failures", 0).putLong("pair_lock_until", 0).commit();
+        }
+    }
+
+    /** Forgets phone B: its key stops working and it must pair again with a new code. */
+    void unpair() {
+        synchronized (pairLock) {
+            prefs.edit().remove("pair_key").putString("code", newCode()).commit();
+        }
+        Client c = client;
+        if (c != null) c.close();
+    }
+
+    final Secure.Policy policy = new Secure.Policy() {
+        @Override public byte[] key() {
+            String k = prefs.getString("pair_key", "");
+            return k.isEmpty() ? null : Secure.unb64(k);
+        }
+        @Override public String code() { return pairCode(); }
+        @Override public long beginPairAttempt() {
+            synchronized (pairLock) {
+                long now = System.currentTimeMillis();
+                long until = prefs.getLong("pair_lock_until", 0);
+                if (now < until) return until - now;
+                int f = prefs.getInt("pair_failures", 0) + 1; // counted up front, cleared on success
+                SharedPreferences.Editor e = prefs.edit().putInt("pair_failures", f);
+                if (f >= FREE_PAIR_ATTEMPTS)
+                    e.putLong("pair_lock_until", now + Math.min(PAIR_LOCK_BASE_MS << Math.min(f - FREE_PAIR_ATTEMPTS, 20), PAIR_LOCK_MAX_MS));
+                e.commit();
+                return 0;
+            }
+        }
+        @Override public void paired(byte[] newKey) {
+            synchronized (pairLock) {
+                // The code is single-use: rotate it so a code seen during pairing is worthless afterwards.
+                prefs.edit().putString("pair_key", Secure.b64(newKey)).putString("code", newCode())
+                        .putInt("pair_failures", 0).putLong("pair_lock_until", 0).commit();
+            }
+            Log.i(TAG, "paired with phone B");
+        }
+    };
+
+    /** Only phones on the hotspot / LAN may connect, never the cellular side. */
+    static boolean fromLocalNetwork(InetAddress a) {
+        if (a == null) return false;
+        if (a.isLinkLocalAddress() || a.isSiteLocalAddress()) return true;          // 10/8, 172.16/12, 192.168/16, fe80::/10
+        return a instanceof Inet6Address && (a.getAddress()[0] & 0xfe) == 0xfc;      // fc00::/7 unique local
+    }
 
     /** User-visible device name ("Pixel 8", "Galaxy S23"...), shown on phone B. */
     String deviceName() {
@@ -205,6 +276,7 @@ public class BridgeService extends Service {
     }
 
     void dial(String number) {
+        if (!NUMBER.matcher(number).matches()) { send(Proto.m("error", "error", "Invalid number")); return; }
         lastDialed = number;
         Bundle extras = new Bundle();
         extras.putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, false);
@@ -248,6 +320,10 @@ public class BridgeService extends Service {
     }
 
     void sendSms(String to, String body) {
+        if (!NUMBER.matcher(to).matches() || body.isEmpty() || body.length() > MAX_SMS_CHARS) {
+            send(Proto.m("sms_sent", "address", to, "ok", false, "error", "Invalid recipient or message"));
+            return;
+        }
         try {
             SmsManager sm = getSystemService(SmsManager.class);
             ArrayList<String> parts = sm.divideMessage(body);
@@ -268,6 +344,12 @@ public class BridgeService extends Service {
                 server.bind(new InetSocketAddress(Proto.BRIDGE_PORT));
                 while (true) {
                     Socket s = server.accept();
+                    if (!fromLocalNetwork(s.getInetAddress()) || pending.get() >= MAX_PENDING) {
+                        Log.w(TAG, "rejected connection from " + s.getInetAddress());
+                        try { s.close(); } catch (Exception ignored) {}
+                        continue;
+                    }
+                    pending.incrementAndGet();
                     s.setTcpNoDelay(true);
                     s.setKeepAlive(true);
                     new Client(s).start();
@@ -293,7 +375,8 @@ public class BridgeService extends Service {
 
     class Client extends Thread {
         final Socket sock;
-        DataOutputStream out;
+        volatile DataOutputStream out;  // set only after authentication
+        volatile Secure sec;
 
         Client(Socket s) { super("bridge-client"); sock = s; }
 
@@ -304,12 +387,14 @@ public class BridgeService extends Service {
             DataOutputStream o2 = out;
             if (o2 == null) return;
             writer.execute(() -> {
-                try { Proto.json(o2, o); } catch (Exception e) { close(); }
+                try { Proto.json(o2, sec, o); } catch (Exception e) { close(); }
             });
         }
 
         void sendAudio(byte[] b, int len) {
-            try { Proto.write(out, Proto.AUDIO, b, 0, len); } catch (Exception e) { close(); }
+            DataOutputStream o2 = out;
+            if (o2 == null) return;
+            try { Proto.write(o2, sec, Proto.AUDIO, b, 0, len); } catch (Exception e) { close(); }
         }
 
         void close() {
@@ -318,20 +403,24 @@ public class BridgeService extends Service {
 
         @Override public void run() {
             try {
-                DataInputStream in = new DataInputStream(new BufferedInputStream(sock.getInputStream()));
-                out = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream()));
-                sock.setSoTimeout(10000);
-                JSONObject hello = Proto.read(in).json();
-                if (!"hello".equals(hello.optString("t")) || !pairCode().equals(hello.optString("code"))) {
-                    Proto.json(out, Proto.msg("auth_fail"));
-                    close();
-                    return;
+                DataInputStream in;
+                DataOutputStream o;
+                Secure s;
+                try {
+                    in = new DataInputStream(new BufferedInputStream(sock.getInputStream()));
+                    o = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream()));
+                    sock.setSoTimeout(10000);
+                    s = Secure.server(in, o, policy);
+                } finally {
+                    pending.decrementAndGet();
                 }
+                sec = s;
+                out = o;
                 sock.setSoTimeout(90000); // B pings every 30 s when idle, 5 s in a call
                 Client old = client;
                 client = this;
                 if (old != null) old.close();
-                Proto.json(out, Proto.m("welcome", "callState", callState, "device", deviceName()));
+                Proto.json(out, sec, Proto.m("welcome", "callState", callState, "device", deviceName()));
                 if (!callState.equals("idle")) {
                     send(callState.equals("ringing")
                             ? Proto.msg("ringing").put("number", callNumber).put("name", Data.nameFor(BridgeService.this, callNumber))
@@ -341,7 +430,7 @@ public class BridgeService extends Service {
                 main.post(() -> goForeground("Phone B connected"));
 
                 while (true) {
-                    Proto.Frame f = Proto.read(in);
+                    Proto.Frame f = Proto.read(in, sec);
                     if (f.type == Proto.AUDIO) {
                         EngineLink e = engineLink;
                         if (e != null) e.sendUp(f.data);

@@ -28,6 +28,7 @@ import android.os.Vibrator;
 import android.util.Log;
 
 import com.callbridge.common.Proto;
+import com.callbridge.common.Secure;
 
 import org.json.JSONObject;
 
@@ -81,7 +82,13 @@ public class LinkService extends Service {
     ConnectivityManager.NetworkCallback netCallback;
     volatile Socket sock;
     volatile Network sockNetwork;
-    volatile DataOutputStream out;
+    /** Authenticated connection to the host, or null. Stream and session keys always travel together. */
+    static final class Conn {
+        final DataOutputStream out; final Secure sec;
+        Conn(DataOutputStream out, Secure sec) { this.out = out; this.sec = sec; }
+    }
+    volatile Conn conn;
+    volatile long authRetryMs;
     volatile boolean running = true;
     volatile long lastRx;
     volatile AudioLink audio;
@@ -149,8 +156,9 @@ public class LinkService extends Service {
     void connectLoop() {
         long backoff = 2000;
         while (running) {
-            String code = prefs.getString("code", "");
-            if (code.isEmpty()) {
+            String code = prefs.getString("code", "").trim();
+            byte[] key = pairKey();
+            if (code.isEmpty() && key == null) {
                 setLink("need_code", "Enter the pairing code shown on the host phone");
                 waitWake(0); // until settings are saved (reconnect() wakes us)
                 continue;
@@ -176,10 +184,18 @@ public class LinkService extends Service {
                 sockNetwork = wifi;
                 lastRx = System.currentTimeMillis();
                 DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
-                out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
-                Proto.json(out, Proto.m("hello", "code", code));
+                DataOutputStream o = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+                // With a key the host must prove itself before we reveal anything, so joining some
+                // other Wi-Fi never leaks credentials to its gateway.
+                Secure sec = Secure.client(in, o, key, code);
+                if (sec.newKey != null) {
+                    prefs.edit().putString("key", Secure.b64(sec.newKey)).remove("code").apply();
+                    Log.i(TAG, "paired with the host phone");
+                }
+                if (sock != s) throw new java.io.IOException("closed during handshake");
+                conn = new Conn(o, sec);
                 while (running) {
-                    Proto.Frame f = Proto.read(in);
+                    Proto.Frame f = Proto.read(in, sec);
                     lastRx = System.currentTimeMillis();
                     if (f.type == Proto.AUDIO) {
                         AudioLink a = audio;
@@ -190,6 +206,10 @@ public class LinkService extends Service {
                         handle(m);
                     }
                 }
+            } catch (Secure.AuthException e) {
+                Log.i(TAG, "auth failed: " + e.reason);
+                authRetryMs = e.retryMs > 0 ? e.retryMs : BACKOFF_MAX_MS;
+                setLink("auth_fail", authMessage(e));
             } catch (Exception e) {
                 Log.i(TAG, "link error: " + e);
             } finally {
@@ -197,7 +217,7 @@ public class LinkService extends Service {
             }
             if (!running) break;
             if (call != null) onLinkLostDuringCall();
-            if ("auth_fail".equals(linkState)) { waitWake(BACKOFF_MAX_MS); continue; }
+            if ("auth_fail".equals(linkState)) { waitWake(authRetryMs); continue; }
             setLink("connecting", "Reconnecting…");
             if (welcomed) backoff = 2000;                 // link was healthy: retry quickly
             waitWake(backoff);                            // a network change wakes us early
@@ -216,6 +236,22 @@ public class LinkService extends Service {
                 continue;
             }
             send(Proto.m("ping"));
+        }
+    }
+
+    byte[] pairKey() {
+        String k = prefs.getString("key", "");
+        try { return k.isEmpty() ? null : Secure.unb64(k); } catch (IllegalArgumentException e) { return null; }
+    }
+
+    static String authMessage(Secure.AuthException e) {
+        switch (e.reason) {
+            case "bad_code": return "Wrong pairing code";
+            case "locked": return "Too many wrong codes. Try again in " + Math.max(1, e.retryMs / 1000) + " s";
+            case "not_paired": case "bad_key": return "Not paired with the host phone any more. Enter the code shown on it";
+            case "host_unverified": return "Could not verify the host phone (wrong Wi-Fi?)";
+            case "upgrade": return "Update the Call Bridge app on the host phone";
+            default: return "Could not connect securely (" + e.reason + ")";
         }
     }
 
@@ -256,24 +292,24 @@ public class LinkService extends Service {
         Socket s = sock;
         sock = null;
         sockNetwork = null;
-        out = null;
+        conn = null;
         try { if (s != null) s.close(); } catch (Exception ignored) {}
     }
 
     /** Queues a control message (safe to call from the UI thread). Returns false if not connected. */
     boolean send(JSONObject o) {
-        DataOutputStream o2 = out;
-        if (o2 == null) return false;
+        Conn c = conn;
+        if (c == null) return false;
         writer.execute(() -> {
-            try { Proto.json(o2, o); } catch (Exception e) { if (out == o2) closeSock(); }
+            try { Proto.json(c.out, c.sec, o); } catch (Exception e) { if (conn == c) closeSock(); }
         });
         return true;
     }
 
     void sendAudio(byte[] b, int len) {
-        DataOutputStream o2 = out;
-        if (o2 == null) return;
-        try { Proto.write(o2, Proto.AUDIO, b, 0, len); } catch (Exception e) { if (out == o2) closeSock(); }
+        Conn c = conn;
+        if (c == null) return;
+        try { Proto.write(c.out, c.sec, Proto.AUDIO, b, 0, len); } catch (Exception e) { if (conn == c) closeSock(); }
     }
 
     void setLink(String state, String detail) {
@@ -556,7 +592,7 @@ public class LinkService extends Service {
         if (addr.equals(MainActivity.openConversation)) return; // user is looking at it
         String who = m.optString("name").isEmpty() ? addr : m.optString("name");
         PendingIntent open = PendingIntent.getActivity(this, addr.hashCode(), new Intent(this, MainActivity.class)
-                .putExtra("conversation", addr).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                .putExtra("conversation", addr).putExtra("tok", MainActivity.INTENT_TOKEN).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification n = new Notification.Builder(this, "sms")
                 .setSmallIcon(android.R.drawable.sym_action_email)

@@ -35,13 +35,26 @@ public final class Proto {
         }
     }
 
+    public static final int MAX_FRAME = 16 * 1024 * 1024;
+
     public static Frame read(DataInputStream in) throws IOException {
+        return read(in, MAX_FRAME);
+    }
+
+    /** Reads one frame, rejecting payloads over {@code max} bytes (use a small max before authentication). */
+    public static Frame read(DataInputStream in, int max) throws IOException {
         int type = in.readUnsignedByte();
         int len = in.readInt();
-        if (len < 0 || len > 16 * 1024 * 1024) throw new IOException("bad frame length " + len);
+        if (len < 0 || len > max) throw new IOException("bad frame length " + len);
         byte[] b = new byte[len];
         in.readFully(b);
         return new Frame(type, b);
+    }
+
+    /** Reads and decrypts one frame of an established secure session. */
+    public static Frame read(DataInputStream in, Secure s) throws IOException {
+        Frame f = read(in, MAX_FRAME);
+        return new Frame(f.type, s.open(f.type, f.data));
     }
 
     public static void write(DataOutputStream out, int type, byte[] data, int off, int len) throws IOException {
@@ -53,9 +66,22 @@ public final class Proto {
         }
     }
 
+    /** Encrypts and writes one frame of an established secure session. */
+    public static void write(DataOutputStream out, Secure s, int type, byte[] data, int off, int len) throws IOException {
+        synchronized (out) { // encrypt under the stream lock so nonce order == wire order
+            byte[] ct = s.seal(type, data, off, len);
+            write(out, type, ct, 0, ct.length);
+        }
+    }
+
     public static void json(DataOutputStream out, JSONObject o) throws IOException {
         byte[] b = o.toString().getBytes(StandardCharsets.UTF_8);
         write(out, JSON, b, 0, b.length);
+    }
+
+    public static void json(DataOutputStream out, Secure s, JSONObject o) throws IOException {
+        byte[] b = o.toString().getBytes(StandardCharsets.UTF_8);
+        write(out, s, JSON, b, 0, b.length);
     }
 
     public static JSONObject msg(String type) {

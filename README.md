@@ -106,7 +106,8 @@ hotspot back on too.
 
 ## Settings (⚙ on the second phone)
 
-- **Pairing code**: shown in the Call Bridge app on the host. You can make a new one there.
+- **Pairing code**: shown in the Call Bridge app on the host. Only needed once: after pairing the
+  phones use a stored key and the host shows a new code. To pair again, enter the new code here.
 - **Host phone address**: leave empty. It's detected automatically as the hotspot gateway.
 - **Call audio method**: *Auto* tries A → B → C. If the other person can't hear you on some phone,
   pick a method manually: A = official interception API, B = call-assistant usage,
@@ -133,9 +134,18 @@ Logs: `adb shell cat /data/local/tmp/callbridge-engine.log` (engine), `adb logca
 
 - **The engine runs with adb-shell privileges** on the host phone. It only listens on
   `127.0.0.1`, and each start generates a new random token that only the bridge app receives.
-- The bridge only accepts the second phone after it presents the **6-digit pairing code**.
-- Traffic between the phones (call control, SMS, audio) is **not encrypted by CallBridge**. It
-  relies on the hotspot's WPA2/WPA3 encryption. Use a strong hotspot password.
+- **Pairing**: the 6-digit code is used once. Pairing derives a random 256-bit key on both phones
+  (ECDH P-256, bound to the code) and the host then rotates the code. Wrong codes are throttled:
+  5 free tries, then a lockout that doubles from 30 s up to 1 h. *New pairing code* on the host
+  clears the lockout, and *Unpair phone B* revokes the key.
+- **Every connection is mutually authenticated** with that key. The host proves itself first, so if
+  the second phone joins some other Wi-Fi, that network's gateway learns nothing.
+- **Traffic is encrypted** (AES-256-GCM, fresh ephemeral keys per connection, counter nonces against
+  replay/reordering) on top of the hotspot's own WPA2/WPA3.
+- The bridge only accepts connections from private/link-local addresses (never the cellular side)
+  and limits unauthenticated connections.
+- Remaining risk: an attacker who is actively intercepting the hotspot *at the moment you pair* could
+  brute-force the 6-digit code offline. Pair on a hotspot with a strong password.
 - Nothing is recorded or stored. Audio is streamed in memory only. Nothing leaves your two
   phones except the call itself.
 - The test hooks in the host app (simulated call states, used by `tests/`) can only be triggered
@@ -146,7 +156,7 @@ Logs: `adb shell cat /data/local/tmp/callbridge-engine.log` (engine), `adb logca
 ## Project layout
 
 ```
-common/            wire protocol shared by all parts (Proto.java)
+common/            wire protocol shared by all parts (Proto.java, Secure.java: pairing + encryption)
 host/              Call Bridge app for the host phone
   .../Engine.java    privileged audio engine (runs via app_process as the shell user)
   .../BridgeService  always-on service: server for the phone, call state, SMS, engine link

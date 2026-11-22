@@ -99,7 +99,7 @@ public class MainActivity extends Activity implements LinkService.Listener {
         if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != 0)
             need.add(Manifest.permission.POST_NOTIFICATIONS);
         if (!need.isEmpty()) requestPermissions(need.toArray(new String[0]), 1);
-        if (prefs.getString("code", "").isEmpty()) showSettings(true);
+        if (prefs.getString("code", "").isEmpty() && prefs.getString("key", "").isEmpty()) showSettings(true);
 
         showTab("keypad");
         handleIntent(getIntent());
@@ -107,8 +107,12 @@ public class MainActivity extends Activity implements LinkService.Listener {
 
     @Override protected void onNewIntent(Intent i) { super.onNewIntent(i); handleIntent(i); }
 
+    /** Per-process secret: other apps can launch this exported activity but cannot forge our extras. */
+    static final String INTENT_TOKEN = com.callbridge.common.Secure.b64(com.callbridge.common.Secure.random(16));
+
     void handleIntent(Intent i) {
-        String conv = i == null ? null : i.getStringExtra("conversation");
+        if (i == null || !INTENT_TOKEN.equals(i.getStringExtra("tok"))) return;
+        String conv = i.getStringExtra("conversation");
         if (conv != null) { showTab("messages"); openConversation(0, conv, ""); }
     }
 
@@ -486,7 +490,8 @@ public class MainActivity extends Activity implements LinkService.Listener {
         LinearLayout v = Ui.col(this);
         EditText code = new EditText(this);
         code.setInputType(InputType.TYPE_CLASS_NUMBER);
-        code.setHint("Pairing code (shown on the host phone)");
+        code.setHint(prefs.getString("key", "").isEmpty() ? "Pairing code (shown on the host phone)"
+                : "Paired. Enter a new code only to pair again");
         code.setText(prefs.getString("code", ""));
         v.addView(code);
         EditText host = new EditText(this);
@@ -526,7 +531,9 @@ public class MainActivity extends Activity implements LinkService.Listener {
                 .setPositiveButton("Save", (d, w) -> {
                     boolean reconnect = !code.getText().toString().trim().equals(prefs.getString("code", ""))
                             || !host.getText().toString().trim().equals(prefs.getString("host", ""));
-                    prefs.edit().putString("code", code.getText().toString().trim())
+                    SharedPreferences.Editor ed = prefs.edit();
+                    if (!code.getText().toString().trim().isEmpty() && reconnect) ed.remove("key"); // re-pair
+                    ed.putString("code", code.getText().toString().trim())
                             .putString("host", host.getText().toString().trim())
                             .putString("method", methods[Math.max(0, method.getSelectedItemPosition())])
                             .putBoolean("muteMic", mute.isChecked()).apply();
