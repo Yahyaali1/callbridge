@@ -1,0 +1,21 @@
+# build output
+build/
+out/
+*.apk
+*.dex
+*.class
+
+# signing keys
+*.keystore
+*.jks
+
+# recordings / dumps from debugging (may contain real call audio)
+*.wav
+*.pcm
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.iml
+__pycache__/
